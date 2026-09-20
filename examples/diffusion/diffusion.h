@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 enum diffusion_algorithm {
     DIFFUSION_ALGORITHM_ORIGIN           = 0,
@@ -81,6 +82,12 @@ struct diffusion_eb_params {
     bool    gpu_sample_reduce    = false;  // Stage-1: argmax/entropy/one multinomial draw per position done on
                                            // the GPU from sc_dev (skips the 268 MB logits D2H + host reductions).
                                            // Requires gpu_sampling. FP-equivalent: argmax exact, Z/entropy ~1e-4.
+
+    // structured read (JEV-like): pin caller-provided tokens at fixed canvas positions, run the requested
+    // steps at temperature 1, and read back the per-position argmax and entropy without committing.
+    std::vector<llama_token> seed_canvas;  // size == canvas_length; LLAMA_TOKEN_NULL marks a free slot
+    bool                     read_only    = false;
+    float *                  out_entropy   = nullptr;  // optional [canvas_length] per-position entropy
 
     diffusion_step_callback_t step_callback           = nullptr;
     void *                    step_callback_user_data = nullptr;

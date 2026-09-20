@@ -375,10 +375,36 @@ int main(int argc, char ** argv) {
             }
         }
 
-        LOG_INF("diffusion_eb: max_steps=%d t=[%.3f,%.3f] entropy_bound=%.4f stability=%d confidence=%.4f kv_cache=%s gpu_sampling=%s sample_reduce=%s\n",
+        // structured read (JEV-like): pin a template canvas and/or request a read-only pass
+        eb_params.read_only = params.diffusion.read_only;
+        if (params.diffusion.read_only && params.diffusion.eb_max_steps <= 0) {
+            eb_params.max_denoising_steps = 1;  // a read is one forward unless more steps are requested
+        }
+        if (!params.diffusion.seed_canvas.empty()) {
+            eb_params.seed_canvas.assign((size_t) canvas_length, LLAMA_TOKEN_NULL);
+            int32_t n_seed = 0;
+            for (const auto & tok : string_split<std::string>(params.diffusion.seed_canvas, ',')) {
+                if (n_seed >= (int32_t) canvas_length) {
+                    break;
+                }
+                const int64_t id = strtoll(tok.c_str(), nullptr, 10);
+                eb_params.seed_canvas[n_seed++] = id < 0 ? LLAMA_TOKEN_NULL : (llama_token) id;
+            }
+            if (n_seed != (int32_t) canvas_length) {
+                LOG_ERR("error: --diffusion-seed-canvas needs %d ids (one per canvas position), got %d\n",
+                        (int32_t) canvas_length, n_seed);
+                return 1;
+            }
+        }
+
+        LOG_INF("diffusion_eb: max_steps=%d t=[%.3f,%.3f] entropy_bound=%.4f stability=%d confidence=%.4f kv_cache=%s gpu_sampling=%s sample_reduce=%s read_only=%s seed=%d\n",
                 eb_params.max_denoising_steps, eb_params.t_min, eb_params.t_max, eb_params.entropy_bound,
                 eb_params.stability_threshold, eb_params.confidence_threshold, eb_params.kv_cache ? "on" : "off",
-                eb_params.gpu_sampling ? "on" : "off", eb_params.gpu_sample_reduce ? "on" : "off");
+                eb_params.gpu_sampling ? "on" : "off", eb_params.gpu_sample_reduce ? "on" : "off",
+                eb_params.read_only ? "on" : "off", (int) eb_params.seed_canvas.size());
+    } else if (!params.diffusion.seed_canvas.empty() || params.diffusion.read_only) {
+        LOG_ERR("error: --diffusion-seed-canvas / --diffusion-read-only need a canvas diffusion model\n");
+        return 1;
     }
 
     // Trim a denoised canvas: cut at the first end-of-generation token, or (checkpoints often emit no stop
@@ -436,7 +462,7 @@ int main(int argc, char ** argv) {
         }
 
         const int32_t max_ub   = std::min((int32_t) params.n_ubatch, (int32_t) llama_n_ctx(ctx));
-        const int     n_blocks = std::max(1, params.diffusion.blocks);
+        const int     n_blocks = params.diffusion.read_only ? 1 : std::max(1, params.diffusion.blocks);
         std::vector<llama_token> response;
 
         for (int b = 0; b < n_blocks; b++) {
@@ -457,17 +483,38 @@ int main(int argc, char ** argv) {
             cb_data.n_input        = prefix_len;
 
             int32_t n_generated = 0;
+            std::vector<float> entropy_out;
+            if (use_eb && eb_params.read_only) {
+                entropy_out.assign((size_t) canvas_length, 0.0f);
+                eb_params.out_entropy = entropy_out.data();
+            }
             if (use_eb) {
                 diffusion_generate_entropy_bound(ctx, prefix.data(), output_tokens.data(), prefix_len, eb_params, n_generated);
             } else {
                 diffusion_generate(ctx, prefix.data(), output_tokens.data(), prefix_len, diff_params, n_generated);
             }
+            eb_params.out_entropy = nullptr;
             if (n_generated <= prefix_len) {
                 if (b == 0) {
                     LOG_INF("Error: diffusion generation failed\n");
                     return "";
                 }
                 break;
+            }
+
+            // structured read: report the per-position canvas and entropy, no trimming or block commit
+            if (use_eb && eb_params.read_only) {
+                const llama_token * canvas = output_tokens.data() + prefix_len;
+                std::string ids;
+                std::string ents;
+                for (int32_t i = 0; i < (int32_t) canvas_length; i++) {
+                    if (i) { ids += ","; ents += ","; }
+                    ids  += std::to_string((int) canvas[i]);
+                    ents += std::to_string((double) entropy_out[i]);
+                }
+                LOG_INF("JEV canvas=[%s] entropy=[%s]\n", ids.c_str(), ents.c_str());
+                return common_detokenize(vocab,
+                    std::vector<llama_token>(canvas, canvas + canvas_length), false);
             }
 
             const llama_token * canvas = output_tokens.data() + prefix_len;

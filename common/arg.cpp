@@ -4562,6 +4562,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        {"--diffusion-seed-canvas"}, "IDS",
+        "structured read: comma-separated canvas token ids, one per canvas position; -1 marks a free slot the "
+        "model must fill (default: none = all free)",
+        [](common_params & params, const std::string & value) { params.diffusion.seed_canvas = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-read-only"},
+        string_format("structured read: run the denoising step(s) at temperature 1 and emit the per-position "
+                      "argmax canvas and entropy without committing (default: %s)", params.diffusion.read_only ? "true" : "false"),
+        [](common_params & params) { params.diffusion.read_only = true; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
         { "-lr", "--learning-rate" }, "ALPHA",
         string_format("adamw or sgd optimizer alpha (default: %.2g); note: sgd alpha recommended ~10x (no momentum)", (double) params.lr.lr0),
         [](common_params & params, const std::string & value) { params.lr.lr0 = std::stof(value); }

@@ -469,8 +469,16 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
     std::uniform_int_distribution<int32_t> vocab_dist(0, n_vocab - 1);
 
     std::vector<llama_token> current_canvas(C);                    // working (renoised) canvas, fed to the forward
+    // structured read: caller-pinned template positions stay fixed, the rest are free and start random
+    const bool        have_seed = (int32_t) params.seed_canvas.size() == C;
+    std::vector<char> pinned(C, 0);
     for (int32_t i = 0; i < C; i++) {
-        current_canvas[i] = vocab_dist(rng);                      // random init (not mask)
+        if (have_seed && params.seed_canvas[i] != LLAMA_TOKEN_NULL) {
+            current_canvas[i] = params.seed_canvas[i];
+            pinned[i]         = 1;
+        } else {
+            current_canvas[i] = vocab_dist(rng);                  // random init (not mask)
+        }
     }
 
     // previous step's raw logits, for self-cond (host upload path only; device SC keeps them on-device)
@@ -529,7 +537,9 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
 
     for (int32_t cur_step = S; cur_step >= 1 && !finished; --cur_step) {
         const int32_t step_idx = S - cur_step;                    // 0-based
-        const float   t        = params.t_min + (params.t_max - params.t_min) * ((float) cur_step / (float) S);
+        // structured read samples at temperature 1 so the reported entropy is the raw-logit entropy
+        const float   t        = params.read_only ? 1.0f
+                               : params.t_min + (params.t_max - params.t_min) * ((float) cur_step / (float) S);
         const float   temp_inv = 1.0f / t;
 
         if (params.kv_cache) {
@@ -654,9 +664,16 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         // renoise: accepted -> sampled token, rest -> fresh random; the displayed/output canvas is the argmax
         float entropy_sum = 0.0f;
         for (int32_t pos = 0; pos < C; pos++) {
+            if (pinned[pos]) {
+                current_canvas[pos]          = params.seed_canvas[pos];
+                output_tokens[n_input + pos] = params.seed_canvas[pos];
+                if (params.out_entropy) { params.out_entropy[pos] = 0.0f; }
+                continue;
+            }
             current_canvas[pos]          = accepted[pos] ? denoiser[pos] : renoise[pos];
             output_tokens[n_input + pos] = argmax_canvas[pos];
             entropy_sum += entropy[pos];
+            if (params.out_entropy) { params.out_entropy[pos] = entropy[pos]; }
         }
 
         // adaptive stop: argmax stable for stability_threshold steps AND confident (low mean entropy)
