@@ -153,6 +153,11 @@ int main(int argc, char ** argv) {
         }
     }
     if (canvas_length <= 0) { fprintf(stderr, "model has no diffusion.canvas_length\n"); return 1; }
+    // testing/demo: run on a narrower canvas than the model default (the JEV reads use a short template)
+    if (const char * e = getenv("DG_CANVAS")) {
+        const int64_t c = atoll(e);
+        if (c > 0) { canvas_length = c; }
+    }
 
     // Enable the self-conditioning graph before context creation so the reserve sizes the compute buffer
     // (matches the CLI). The entropy-bound decoder supplies the real SC state per step.
@@ -331,6 +336,27 @@ int main(int argc, char ** argv) {
                     seed_canvas.push_back(id < 0 ? LLAMA_TOKEN_NULL : (llama_token) id);
                 }
             }
+            // optional canvas_template: UTF-8 answer template with '@' marking free single-token slots.
+            // Tokenized here (the server owns the tokenizer); the remaining canvas positions stay free.
+            if (req.contains("canvas_template")) {
+                const std::string tmpl = req.at("canvas_template").get<std::string>();
+                seed_canvas.clear();
+                size_t pos = 0;
+                while (true) {
+                    const size_t at  = tmpl.find('@', pos);
+                    const std::string seg = tmpl.substr(pos, at == std::string::npos ? std::string::npos : at - pos);
+                    const std::vector<llama_token> st = common_tokenize(vocab, seg, false, true);
+                    seed_canvas.insert(seed_canvas.end(), st.begin(), st.end());
+                    if (at == std::string::npos) { break; }
+                    seed_canvas.push_back(LLAMA_TOKEN_NULL);   // open slot
+                    pos = at + 1;
+                }
+                if ((int) seed_canvas.size() > (int) canvas_length) {
+                    throw std::runtime_error("canvas_template too long");
+                }
+                // pad the rest of the canvas with a fixed filler (only the '@' slots stay open)
+                seed_canvas.resize((size_t) canvas_length, 0);
+            }
             std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(req.at("messages"));
             common_chat_templates_inputs inputs;
             inputs.messages              = messages;
@@ -402,7 +428,25 @@ int main(int argc, char ** argv) {
                     snprintf(buf, sizeof(buf), "%s%.6f", i ? "," : "", (double) entropy_out[i]);
                     js += buf;
                 }
-                js += "]}";
+                // free slots in template order: the caller maps these to its questions
+                js += "],\"slots\":[";
+                bool first_slot = true;
+                for (int32_t i = 0; i < (int32_t) canvas_length; i++) {
+                    if (!seed_canvas.empty() && seed_canvas[i] != LLAMA_TOKEN_NULL) { continue; }
+                    if (!first_slot) { js += ","; }
+                    first_slot = false;
+                    const std::string st = common_detokenize(vocab, { canvas[i] }, false);
+                    char ebuf[32];
+                    snprintf(ebuf, sizeof(ebuf), "%.6f", (double) entropy_out[i]);
+                    js += "{\"pos\":" + std::to_string((int) i)
+                        + ",\"token\":" + std::to_string((int) canvas[i])
+                        + ",\"text\":" + common_json::make(st).dump()
+                        + ",\"entropy\":" + ebuf + "}";
+                }
+                js += "],\"text\":";
+                js += common_json::make(common_detokenize(vocab,
+                        std::vector<llama_token>(canvas, canvas + canvas_length), /*special*/ true)).dump();
+                js += "}";
                 printf("R %s\n", js.c_str()); fflush(stdout);
                 blocks_run++;
                 break;
