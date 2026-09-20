@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -32,7 +33,8 @@ class JevClient:
         self.n_vocab = int(n_vocab)
         self.maxtok = int(maxtok)
 
-    def read(self, system: str, state: str, template: str, seed: int = 0, max_steps: int = 1) -> dict:
+    def read(self, system: str, state: str, template: str, seed: int = 0, max_steps: int = 1,
+             labels: list[str] | None = None) -> dict:
         assert self.proc.stdin is not None and self.proc.stdout is not None
         req = {
             "seed": seed,
@@ -44,6 +46,8 @@ class JevClient:
                 {"role": "user", "content": state},
             ],
         }
+        if labels:
+            req["labels"] = list(labels)
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(req, f)
             path = f.name
@@ -75,16 +79,28 @@ class JevClient:
 
 
 def run_task(client: JevClient, system: str, state: str, template: str, questions: list[tuple[str, list[str]]], max_steps: int) -> None:
-    out = client.read(system, state, template, max_steps=max_steps)
+    labels: list[str] = []
+    for _, options in questions:
+        for option in options:
+            if option not in labels:
+                labels.append(option)
+    out = client.read(system, state, template, max_steps=max_steps, labels=labels)
     slots = out["slots"][: len(questions)]  # the canvas is padded; only the template's slots matter
     if len(slots) != len(questions):
         print(f"  warning: {len(slots)} slots for {len(questions)} questions")
-    print(f"  text: {out['text'].strip()[:120]!r}")
+    print(f"  text: {out['text'].strip()[:110]!r}")
     for (name, options), slot in zip(questions, slots):
-        label = slot["text"].strip()
-        ok = label in options
-        mark = "" if ok else "  (not an allowed label)"
-        print(f"  {name:10s} = {label!r:14s} entropy={slot['entropy']:.3f}{mark}")
+        lp = slot.get("logprobs")
+        if not lp or len(lp) != len(labels):
+            print(f"  {name:10s} = {slot['text'].strip()!r:14s} entropy={slot['entropy']:.3f} (no logprobs)")
+            continue
+        vals = [lp[labels.index(o)] for o in options]
+        m = max(vals)
+        ex = [math.exp(v - m) for v in vals]
+        s = sum(ex)
+        probs = [e / s for e in ex]
+        best = max(range(len(options)), key=lambda k: probs[k])
+        print(f"  {name:10s} = {options[best]!r:14s} p={probs[best]:.3f} entropy={slot['entropy']:.3f}")
 
 
 def sys_prompt(questions: list[tuple[str, list[str]]]) -> str:
@@ -112,7 +128,7 @@ def task_triage() -> tuple:
 
 
 def task_language() -> tuple:
-    questions = [("language", ["python", "rust", "javascript", "go", "c", "sql", "bash", "ruby", "java", "haskell"])]
+    questions = [("language", ["python", "rust", "java", "go", "sql"])]
     template = "language: @"
     state = (
         "def quicksort(xs):\n"

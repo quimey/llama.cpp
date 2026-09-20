@@ -89,6 +89,10 @@ struct diffusion_eb_params {
     bool                     read_only    = false;
     float *                  out_entropy   = nullptr;  // optional [canvas_length] per-position entropy
 
+    // per-label logprobs for a read: log-softmax at temperature 1 for these tokens at every position
+    std::vector<llama_token> label_ids;                 // candidate label token ids (single tokens)
+    float *                  out_label_logprobs = nullptr;  // [canvas_length * label_ids.size()]
+
     diffusion_step_callback_t step_callback           = nullptr;
     void *                    step_callback_user_data = nullptr;
     bool                      visual_mode             = false;

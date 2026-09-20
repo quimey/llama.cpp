@@ -574,7 +574,9 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         }
 
         // Stage-1: when on, skip the 268 MB logits D2H + host reductions and sample on the GPU from sc_dev.
-        const bool gpu_reduce  = dev_sc && device_sample_ok;
+        // Per-label logprobs need the raw rows, so they force the host path.
+        const int32_t n_labels   = (int32_t) params.label_ids.size();
+        const bool gpu_reduce  = dev_sc && device_sample_ok && n_labels == 0;
         const bool want_logits = !gpu_reduce;
         const float * logits = nullptr;                           // canvas rows packed: [C or max_length, n_vocab]
         if (want_logits) {
@@ -615,6 +617,13 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                 entropy[pos]       = H;
                 argmax_canvas[pos] = amax;
                 denoiser[pos]      = sampled;
+                if (params.out_label_logprobs) {
+                    const float logZ = m + logf(Z);
+                    float * llp = params.out_label_logprobs + (size_t) pos * n_labels;
+                    for (int32_t li = 0; li < n_labels; li++) {
+                        llp[li] = row[params.label_ids[li]] * temp_inv - logZ;
+                    }
+                }
                 // device SC keeps prev-step logits on-device (cpy in-graph), so no host stash needed
                 if (!dev_sc) {
                     std::memcpy(sc_buffer.data() + (size_t) pos * n_vocab, row, n_vocab * sizeof(float));

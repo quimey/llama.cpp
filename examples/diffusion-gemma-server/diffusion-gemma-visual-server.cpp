@@ -319,6 +319,7 @@ int main(int argc, char ** argv) {
         bool read_only = false;
         int  read_steps = 0;
         std::vector<llama_token> seed_canvas;
+        std::vector<llama_token> label_ids;
         std::vector<llama_token> prefix;
         try {
             const std::string raw = read_text_file(line);
@@ -356,6 +357,21 @@ int main(int argc, char ** argv) {
                 }
                 // pad the rest of the canvas with a fixed filler (only the '@' slots stay open)
                 seed_canvas.resize((size_t) canvas_length, 0);
+            }
+            // optional labels: per-label logprobs at every canvas position (single-token labels)
+            if (req.contains("labels") && req.at("labels").is_array()) {
+                const common_json & arr = req.at("labels");
+                for (size_t li = 0; li < arr.size(); li++) {
+                    const std::string lab = arr.at(li).get<std::string>();
+                    const std::vector<llama_token> lt = common_tokenize(vocab, lab, false, false);
+                    if (lt.empty()) {
+                        throw std::runtime_error("label tokenizes to nothing: " + lab);
+                    }
+                    if (lt.size() > 1) {
+                        fprintf(stderr, "label not a single token, using the first: %s\n", lab.c_str());
+                    }
+                    label_ids.push_back(lt[0]);
+                }
             }
             std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(req.at("messages"));
             common_chat_templates_inputs inputs;
@@ -396,6 +412,7 @@ int main(int argc, char ** argv) {
             eb.seed       = seed + b;   // distinct per block, deterministic from the request seed
 
             std::vector<float> entropy_out;
+            std::vector<float> label_llp;
             vis_cb_data cb{ b, prefix_len, 0, 0, stdout, vocab };
             if (read_only) {
                 eb.read_only           = true;
@@ -403,6 +420,11 @@ int main(int argc, char ** argv) {
                 eb.seed_canvas         = seed_canvas;
                 entropy_out.assign((size_t) canvas_length, 0.0f);
                 eb.out_entropy         = entropy_out.data();
+                if (!label_ids.empty()) {
+                    label_llp.assign((size_t) canvas_length * label_ids.size(), 0.0f);
+                    eb.label_ids          = label_ids;
+                    eb.out_label_logprobs = label_llp.data();
+                }
             } else {
                 eb.visual_mode             = true;
                 eb.step_callback           = vis_step_callback;
@@ -441,7 +463,18 @@ int main(int argc, char ** argv) {
                     js += "{\"pos\":" + std::to_string((int) i)
                         + ",\"token\":" + std::to_string((int) canvas[i])
                         + ",\"text\":" + common_json::make(st).dump()
-                        + ",\"entropy\":" + ebuf + "}";
+                        + ",\"entropy\":" + ebuf;
+                    if (!label_ids.empty()) {
+                        js += ",\"logprobs\":[";
+                        const float * llp = label_llp.data() + (size_t) i * label_ids.size();
+                        for (size_t li = 0; li < label_ids.size(); li++) {
+                            char lb[32];
+                            snprintf(lb, sizeof(lb), "%s%.6f", li ? "," : "", (double) llp[li]);
+                            js += lb;
+                        }
+                        js += "]";
+                    }
+                    js += "}";
                 }
                 js += "],\"text\":";
                 js += common_json::make(common_detokenize(vocab,
