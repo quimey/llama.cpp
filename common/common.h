@@ -431,6 +431,7 @@ struct common_params_diffusion {
     // structured read (JEV-like): pin a template canvas and read back per-position argmax + entropy
     std::string seed_canvas;          // comma-separated canvas token ids; -1 = free slot (default: none)
     bool        read_only = false;    // run the requested steps at temperature 1 and emit argmax + entropy
+    std::string read_out;             // write the read as JSON to this file (default: log it)
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)

@@ -502,17 +502,28 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            // structured read: report the per-position canvas and entropy, no trimming or block commit
+            // structured read: report the per-position canvas and entropy as JSON, no trimming or block commit
             if (use_eb && eb_params.read_only) {
                 const llama_token * canvas = output_tokens.data() + prefix_len;
-                std::string ids;
-                std::string ents;
+                std::string json = "{\"canvas\":[";
                 for (int32_t i = 0; i < (int32_t) canvas_length; i++) {
-                    if (i) { ids += ","; ents += ","; }
-                    ids  += std::to_string((int) canvas[i]);
-                    ents += std::to_string((double) entropy_out[i]);
+                    if (i) { json += ","; }
+                    json += std::to_string((int) canvas[i]);
                 }
-                LOG_INF("JEV canvas=[%s] entropy=[%s]\n", ids.c_str(), ents.c_str());
+                json += "],\"entropy\":[";
+                for (int32_t i = 0; i < (int32_t) canvas_length; i++) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%s%.6f", i ? "," : "", (double) entropy_out[i]);
+                    json += buf;
+                }
+                json += "]}";
+                if (!params.diffusion.read_out.empty()) {
+                    FILE * f = fopen(params.diffusion.read_out.c_str(), "w");
+                    if (f) { fputs(json.c_str(), f); fputc('\n', f); fclose(f); }
+                    else { LOG_ERR("error: cannot write %s\n", params.diffusion.read_out.c_str()); }
+                } else {
+                    LOG_INF("JEV read: %s\n", json.c_str());
+                }
                 return common_detokenize(vocab,
                     std::vector<llama_token>(canvas, canvas + canvas_length), false);
             }
