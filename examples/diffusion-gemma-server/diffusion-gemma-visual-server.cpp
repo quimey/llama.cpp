@@ -431,8 +431,10 @@ int main(int argc, char ** argv) {
                 eb.step_callback_user_data = &cb;
             }
 
+            const int64_t t_gen0 = ggml_time_us();
             int32_t n_generated = 0;
             diffusion_generate_entropy_bound(ctx, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
+            const double gen_ms = (ggml_time_us() - t_gen0) / 1000.0;
             eb.out_entropy = nullptr;
             if (n_generated <= prefix_len) { if (b == 0) printf("ERR gen\n"); break; }
 
@@ -476,7 +478,16 @@ int main(int argc, char ** argv) {
                     }
                     js += "}";
                 }
-                js += "],\"text\":";
+                js += "],\"stats\":{\"prompt_n\":" + std::to_string(P)
+                    + ",\"canvas_n\":" + std::to_string((int) canvas_length)
+                    + ",\"passes\":" + std::to_string(read_steps > 0 ? read_steps : 1)
+                    + ",\"gen_ms\":";
+                {
+                    char b[32];
+                    snprintf(b, sizeof(b), "%.2f", gen_ms);
+                    js += b;
+                }
+                js += "},\"text\":";
                 js += common_json::make(common_detokenize(vocab,
                         std::vector<llama_token>(canvas, canvas + canvas_length), /*special*/ true)).dump();
                 js += "}";
