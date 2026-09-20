@@ -11,9 +11,13 @@
 //   stdin  : a line containing a request-file path R
 //   file R : UTF-8 JSON  {"seed": <int>, "n_blocks": <int>, "messages": [ {"role","content"}, ... ]}
 //            (messages are OpenAI chat-completion format; the GGUF chat template is applied here)
+//            structured read (optional): "read_only": true, "seed_canvas": [<int>...] (one per canvas
+//            position, -1 = free slot), "max_steps": <int> (default 1). A read emits one "R" record and
+//            does not stream frames or commit a block.
 //   stdout : a stream of newline records, then "DONE":
 //              F <block> <step> <total> <json-string>   one per denoising step (current canvas, decoded)
 //              C <block> <json-string>                  cumulative committed answer text after this block
+//              R <json-string>                          structured read: {"canvas":[...],"entropy":[...]}
 //              STATS <key=value ...>                    one summary line (counts + ms timing) before DONE
 //              DONE                                      end of this request
 //              ERR <msg>                                request failed; "ERR toolong <needed> <budget>"
@@ -22,7 +26,8 @@
 // Startup line: "READY <n_vocab> <MAXTOK>" (MAXTOK is the resolved per-turn context budget; see auto-size).
 //
 // Usage: llama-diffusion-gemma-visual-server <model.gguf>
-//   env: NGL (gpu layers), MAXTOK (0/unset = auto-size the largest context that fits VRAM, else RAM), FA
+//   env: NGL (gpu layers), MAXTOK (0/unset = auto-size the largest context that fits VRAM, else RAM), FA,
+//        DG_N_CPU_MOE (keep the experts of the first N layers on CPU; low-VRAM hosts)
 //   diagnostics: DG_FREE_VRAM_MB / DG_FREE_RAM_MB override the probe's memory budgets (testing only)
 
 #include "llama.h"
@@ -121,6 +126,16 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all(); // load dynamic backends so NGL can offload to GPU
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = atoi(getenv("NGL") ? getenv("NGL") : "0");
+    // keep the MoE experts of the first N layers on CPU (low-VRAM / iGPU hosts); 0 = off
+    std::vector<llama_model_tensor_buft_override> cpu_moe_overrides;
+    if (const char * e = getenv("DG_N_CPU_MOE")) {
+        const int n = atoi(e);
+        if (n > 0) {
+            llm_add_n_cpu_ffn_overrides(n, LLM_FFN_EXPS_REGEX, cpu_moe_overrides);
+            cpu_moe_overrides.push_back({ nullptr, nullptr });
+            mparams.tensor_buft_overrides = cpu_moe_overrides.data();
+        }
+    }
     llama_model * model = llama_model_load_from_file(argv[1], mparams);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
     if (!llama_model_is_diffusion(model)) { fprintf(stderr, "not a diffusion model\n"); return 1; }
@@ -296,6 +311,9 @@ int main(int argc, char ** argv) {
 
         // parse the request file: {"seed", "n_blocks", "messages":[...]} -> chat template -> token prefix
         int seed = 0, n_blocks = 1;
+        bool read_only = false;
+        int  read_steps = 0;
+        std::vector<llama_token> seed_canvas;
         std::vector<llama_token> prefix;
         try {
             const std::string raw = read_text_file(line);
@@ -303,6 +321,16 @@ int main(int argc, char ** argv) {
             const common_json req = common_json::parse(raw);
             seed     = req.value("seed", 0);
             n_blocks = req.value("n_blocks", 1);
+            read_only  = req.value("read_only", false);
+            read_steps = req.value("max_steps", 0);
+            if (req.contains("seed_canvas") && req.at("seed_canvas").is_array()) {
+                const common_json & arr = req.at("seed_canvas");
+                seed_canvas.reserve(arr.size());
+                for (size_t si = 0; si < arr.size(); si++) {
+                    const int64_t id = arr.at(si).get<int64_t>();
+                    seed_canvas.push_back(id < 0 ? LLAMA_TOKEN_NULL : (llama_token) id);
+                }
+            }
             std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(req.at("messages"));
             common_chat_templates_inputs inputs;
             inputs.messages              = messages;
@@ -316,6 +344,9 @@ int main(int argc, char ** argv) {
             printf("ERR parse %s\n", e.what()); fflush(stdout); continue;
         }
         if (prefix.empty()) { printf("ERR emptyprompt\n"); fflush(stdout); continue; }
+        if (!seed_canvas.empty() && (int) seed_canvas.size() != (int) canvas_length) {
+            printf("ERR seedlen %d %d\n", (int) seed_canvas.size(), (int) canvas_length); fflush(stdout); continue;
+        }
 
         const int P = (int) prefix.size();          // original prompt length; the answer is what grows past it
         std::vector<llama_token> answer;             // cumulative committed canvas tokens (across blocks)
@@ -325,7 +356,7 @@ int main(int argc, char ** argv) {
         int total_steps   = 0;
         int64_t total_viz_us = 0;                     // cumulative host visualization time (frames + commits)
 
-        for (int b = 0; b < std::max(1, n_blocks); b++) {
+        for (int b = 0; b < (read_only ? 1 : std::max(1, n_blocks)); b++) {
             const int32_t prefix_len = (int32_t) prefix.size();
             const int32_t max_length = prefix_len + (int32_t) canvas_length;
             if (max_length > MAXTOK) {
@@ -335,16 +366,47 @@ int main(int argc, char ** argv) {
             }
 
             diffusion_eb_params eb = base;
-            eb.max_length              = max_length;
-            eb.seed                    = seed + b;   // distinct per block, deterministic from the request seed
-            eb.visual_mode             = true;
+            eb.max_length = max_length;
+            eb.seed       = seed + b;   // distinct per block, deterministic from the request seed
+
+            std::vector<float> entropy_out;
             vis_cb_data cb{ b, prefix_len, 0, 0, stdout, vocab };
-            eb.step_callback           = vis_step_callback;
-            eb.step_callback_user_data = &cb;
+            if (read_only) {
+                eb.read_only           = true;
+                eb.max_denoising_steps = read_steps > 0 ? read_steps : 1;
+                eb.seed_canvas         = seed_canvas;
+                entropy_out.assign((size_t) canvas_length, 0.0f);
+                eb.out_entropy         = entropy_out.data();
+            } else {
+                eb.visual_mode             = true;
+                eb.step_callback           = vis_step_callback;
+                eb.step_callback_user_data = &cb;
+            }
 
             int32_t n_generated = 0;
             diffusion_generate_entropy_bound(ctx, prefix.data(), output_tokens.data(), prefix_len, eb, n_generated);
+            eb.out_entropy = nullptr;
             if (n_generated <= prefix_len) { if (b == 0) printf("ERR gen\n"); break; }
+
+            // structured read: emit the per-position argmax canvas and entropy, no commit
+            if (read_only) {
+                const llama_token * canvas = output_tokens.data() + prefix_len;
+                std::string js = "{\"canvas\":[";
+                for (int32_t i = 0; i < (int32_t) canvas_length; i++) {
+                    if (i) { js += ","; }
+                    js += std::to_string((int) canvas[i]);
+                }
+                js += "],\"entropy\":[";
+                for (int32_t i = 0; i < (int32_t) canvas_length; i++) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%s%.6f", i ? "," : "", (double) entropy_out[i]);
+                    js += buf;
+                }
+                js += "]}";
+                printf("R %s\n", js.c_str()); fflush(stdout);
+                blocks_run++;
+                break;
+            }
 
             blocks_run++;
             total_steps   += cb.steps;
